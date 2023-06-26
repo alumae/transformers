@@ -17,7 +17,7 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -674,10 +674,16 @@ class Wav2Vec2EncoderLayer(nn.Module):
         self.feed_forward = Wav2Vec2FeedForward(config)
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, hidden_states, attention_mask=None, output_attentions=False):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        output_attentions=False,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+    ):
         attn_residual = hidden_states
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions, past_key_value=past_key_value
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
@@ -713,11 +719,12 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
     ):
         attn_residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions, past_key_value=past_key_value
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
@@ -745,6 +752,7 @@ class Wav2Vec2Encoder(nn.Module):
         self,
         hidden_states: torch.tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
@@ -771,15 +779,16 @@ class Wav2Vec2Encoder(nn.Module):
 
         deepspeed_zero3_is_enabled = is_deepspeed_zero3_enabled()
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = np.random.uniform(0, 1)
 
-            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
+            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False            
             if not skip_the_layer or deepspeed_zero3_is_enabled:
+                past_key_value = past_key_values[i] if past_key_values is not None else None
                 # under deepspeed zero3 all gpus must run in sync
                 if self.gradient_checkpointing and self.training:
                     # create gradient checkpointing function
@@ -796,7 +805,7 @@ class Wav2Vec2Encoder(nn.Module):
                     )
                 else:
                     layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions, past_key_value=past_key_value
                     )
                 hidden_states = layer_outputs[0]
 
@@ -834,6 +843,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         self,
         hidden_states,
         attention_mask=None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
@@ -853,13 +863,21 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
                 attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
             )
 
+            if past_key_values is not None:
+                # concat prefix and attention mask
+                prefix_attention_mask = torch.ones(attention_mask.shape[0], 1, attention_mask.shape[2], past_key_values[0].shape[3]).to(attention_mask.dtype).to(attention_mask.device)
+                attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=3)
+            #breakpoint()    
+
+
+
         position_embeddings = self.pos_conv_embed(hidden_states)
         hidden_states = hidden_states + position_embeddings
         hidden_states = self.dropout(hidden_states)
 
         deepspeed_zero3_is_enabled = is_deepspeed_zero3_enabled()
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -868,6 +886,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
 
             skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
             if not skip_the_layer or deepspeed_zero3_is_enabled:
+                past_key_value = past_key_values[i] if past_key_values is not None else None
                 # under deepspeed zero3 all gpus must run in sync
                 # XXX: could optimize this like synced_gpus in generate_utils but not sure if it's worth the code complication
                 if self.gradient_checkpointing and self.training:
@@ -885,7 +904,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
                     )
                 else:
                     layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
+                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions, past_key_value=past_key_value
                     )
                 hidden_states = layer_outputs[0]
 
@@ -1293,6 +1312,7 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
         input_values: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1305,7 +1325,7 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
 
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
-
+        
         if attention_mask is not None:
             # compute reduced attention_mask corresponding to feature vectors
             attention_mask = self._get_feature_vector_attention_mask(
@@ -1313,13 +1333,18 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
             )
 
         hidden_states, extract_features = self.feature_projection(extract_features)
+
+        
         hidden_states = self._mask_hidden_states(
             hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
         )
+    
+
 
         encoder_outputs = self.encoder(
             hidden_states,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1666,6 +1691,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
         self,
         input_values: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1684,6 +1710,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
         outputs = self.wav2vec2(
             input_values,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1799,6 +1826,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
         self,
         input_values: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1817,6 +1845,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
         outputs = self.wav2vec2(
             input_values,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1919,6 +1948,7 @@ class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
         self,
         input_values: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1937,6 +1967,7 @@ class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
         outputs = self.wav2vec2(
             input_values,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
